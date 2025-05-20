@@ -1,29 +1,61 @@
 #include <Arduino.h>
+#include <Wire.h>
 #include <LiquidCrystal_I2C.h>
 #include <DNSServer.h>
 #include <WiFi.h>
-#include <AsyncTCP.h>
-#include "ESPAsyncWebServer.h"
+#include <WebServer.h>
 #include <Preferences.h>
-#include "AsyncJson.h"
-#include "ArduinoJson.h"
+#include <ArduinoJson.h>
+#include "esp_wifi.h"
+#include "esp_system.h"
 
-AsyncWebServer server(80);
-Preferences preferences;
+// Debug flag - set to true for verbose debugging
+#define DEBUG_MODE true
 
-// Set the LCD I2C address
-LiquidCrystal_I2C lcd(0x20, 20, 4);
+// Define I2C pins (use default ESP32 pins unless you've connected to different ones)
+#define SDA_PIN 21
+#define SCL_PIN 22
 
-// general device settings
-bool isCapturing = true;
-String MODE; 
+// Define reader input pins
+// card reader DATA0
+#define DATA0 19
+// card reader DATA1
+#define DATA1 18
+
+//define reader output pins
+// LED Output for a GND tie back
+#define LED 32
+// Speaker Output for a GND tie back
+#define SPK 33
+
+//define relay modules
+#define RELAY1 25
+#define RELAY2 26
 
 // card reader config and variables
-
 // max number of bits
 #define MAX_BITS 100
 // time to wait for another weigand pulse
-#define WEIGAND_WAIT_TIME 3000
+#define WEIGAND_WAIT_TIME 500 // Reduced from 3000ms to 500ms for faster response
+
+// Forward declarations for structs
+struct CardData;
+struct Credential;
+
+// Try multiple common LCD addresses - the code will find the correct one
+LiquidCrystal_I2C lcd_0x27(0x27, 20, 4); // Most common address
+LiquidCrystal_I2C lcd_0x3F(0x3F, 20, 4); // Second most common
+LiquidCrystal_I2C lcd_0x20(0x20, 20, 4); // Your original address
+
+// Pointer to the LCD that works
+LiquidCrystal_I2C* lcd = NULL;
+
+WebServer server(80);
+Preferences preferences;
+
+// general device settings
+bool isCapturing = true;
+String MODE = "CTF"; // Default mode
 
 // stores all of the data bits
 volatile unsigned char databits[MAX_BITS];
@@ -44,26 +76,27 @@ unsigned long displayTimeout = 30000;  // 30 seconds
 unsigned long lastCardTime = 0;
 bool displayingCard = false;
 
+// WiFi monitoring variables
+unsigned long lastWifiCheck = 0;
+const unsigned long wifiCheckInterval = 30000; // Check every 30 seconds
+
 // Wifi Settings
-bool APMode;
+bool APMode = true;
 
 // AP Settings
-// ssid_hidden = broadcast ssid = 0, hidden = 1
-// ap_passphrase = NULL for open, min 8 chars, max 63
-
-String ap_ssid;
-String ap_passphrase;
-int ap_channel;
-int ssid_hidden;
+String ap_ssid = "doorsim";
+String ap_passphrase = "";
+int ap_channel = 1;
+int ssid_hidden = 0;
 
 // Speaker and LED Settings
-int spkOnInvalid;
-int spkOnValid;
-int ledValid;
+int spkOnInvalid = 1;
+int spkOnValid = 1;
+int ledValid = 1;
 
 // Custom Display Message
-String customWelcomeMessage;
-String welcomeMessageSelect;
+String customWelcomeMessage = "";
+String welcomeMessageSelect = "default";
 
 // decoded facility code and card code
 unsigned long facilityCode = 0;
@@ -77,6 +110,25 @@ String rawCardData;
 String status;
 String details;
 
+// Add a global flag to help manage interrupt status
+volatile bool interruptsAttached = false;
+
+// Debug variable to track card reading
+volatile bool cardBeingRead = false;
+
+// breaking up card value into 2 chunks to create 10 char HEX value
+volatile unsigned long bitHolder1 = 0;
+volatile unsigned long bitHolder2 = 0;
+unsigned long cardChunk1 = 0;
+unsigned long cardChunk2 = 0;
+
+// Wiegand processing state variables - added for debugging
+volatile unsigned long lastInterruptTime = 0;
+volatile int interruptCount = 0;
+
+// Debug timeout variables
+unsigned long setupStartTime = 0;
+const unsigned long SETUP_TIMEOUT = 60000; // 60 seconds timeout for setup
 
 // store card data for later review
 struct CardData {
@@ -88,28 +140,6 @@ struct CardData {
   String status;   // Add status field
   String details;  // Add details field
 };
-
-// breaking up card value into 2 chunks to create 10 char HEX value
-volatile unsigned long bitHolder1 = 0;
-volatile unsigned long bitHolder2 = 0;
-unsigned long cardChunk1 = 0;
-unsigned long cardChunk2 = 0;
-
-// Define reader input pins
-// card reader DATA0
-#define DATA0 19
-// card reader DATA1
-#define DATA1 18
-
-//define reader output pins
-// LED Output for a GND tie back
-#define LED 32
-// Speaker Output for a GND tie back
-#define SPK 33
-
-//define relay modules
-#define RELAY1 25
-#define RELAY2 26
 
 // store card data for later review
 struct Credential {
@@ -123,10 +153,31 @@ Credential credentials[MAX_CREDENTIALS];
 int validCount = 0;
 
 // maximum number of stored cards
-const int MAX_CARDS = 100; 
+const int MAX_CARDS = 100;
 CardData cardDataArray[MAX_CARDS];
 int cardDataIndex = 0;
 
+// Function declarations
+void ledOnValid();
+void speakerOnValid();
+void speakerOnFailure();
+void lcdInvalidCredentials();
+void printWelcomeMessage();
+void scanI2C();
+void saveSettingsToPreferences();
+void saveCredentialsToPreferences();
+void processCardData();
+void printCardData();
+void clearDatabits();
+void cleanupCardData();
+bool shouldSkipProcessing();
+void processCardNow();
+void printAllCardData();
+const Credential *checkCredential(uint16_t fc, uint16_t cn);
+String centerText(const String &text, int width);
+String prefixPad(const String &in, const char c, const size_t len);
+
+// HTML for the web interface
 const char *index_html = R"rawliteral(
 <!DOCTYPE html>
 <html lang="en">
@@ -327,6 +378,8 @@ const char *index_html = R"rawliteral(
             </div>
             <br><br>
             <button onclick="saveSettings()">Save Settings</button>
+            <br><br>
+            <button onclick="forceRefresh()">Force Refresh Tables</button>
         </div>
     </div>
     <script>
@@ -341,8 +394,8 @@ const char *index_html = R"rawliteral(
                 .then(response => response.json())
                 .then(data => {
                     tableBody.innerHTML = '';
+                    cardData = data; // Store the data for reuse
                     data.forEach((card, index) => {
-                        cardData.push(card);
                         let row = tableBody.insertRow();
                         let cellIndex = row.insertCell(0);
                         let cellBitLength = row.insertCell(1);
@@ -358,6 +411,7 @@ const char *index_html = R"rawliteral(
                         cellHexData.innerHTML = `<a href="#" onclick="copyToClipboard('${card.hexCardData}')">${card.hexCardData}</a>`;
                         cellRawData.innerHTML = card.rawCardData;
                     });
+                    console.log("Updated card table with " + data.length + " cards");
                 })
                 .catch(error => console.error('Error fetching card data:', error));
         }
@@ -395,6 +449,7 @@ const char *index_html = R"rawliteral(
                     cellCardNumber.innerHTML = '<input type="number" id="newCardNumber">';
                     cellName.innerHTML = '<input type="text" id="newName">';
                     cellAction.innerHTML = '<button onclick="addCard()">Save</button>';
+                    console.log("Updated user table with " + data.length + " users");
                 })
                 .catch(error => console.error('Error fetching user data:', error));
         }
@@ -432,6 +487,7 @@ const char *index_html = R"rawliteral(
                         cellStatus.innerHTML = "";
                         cellDetails.innerHTML = "";
                     }
+                    console.log("Updated last read cards table with " + last10Cards.length + " last cards");
                 })
                 .catch(error => console.error('Error fetching last read card data:', error));
         }
@@ -471,6 +527,14 @@ const char *index_html = R"rawliteral(
             document.getElementById('ctfMode').classList.add('hidden');
             document.getElementById('settings').classList.add('hidden');
             document.getElementById(section).classList.remove('hidden');
+            
+            // Update the tables when switching sections
+            if (section === 'lastRead') {
+                updateTable();
+            } else if (section === 'ctfMode') {
+                updateUserTable();
+                updateLastReadCardsTable();
+            }
         }
 
         function toggleCollapsible() {
@@ -500,7 +564,6 @@ const char *index_html = R"rawliteral(
             document.getElementById('ledValid').value = settings.ledValid;
             document.getElementById('spkOnValid').value = settings.spkOnValid;
             document.getElementById('spkOnInvalid').value = settings.spkOnInvalid;
-            toggleWifiSettings();
             toggleWelcomeMessage();
         }
 
@@ -557,7 +620,20 @@ const char *index_html = R"rawliteral(
                 .catch(error => console.error('Error fetching settings:', error));
         }
 
-        window.onload = fetchSettings;
+        function forceRefresh() {
+            updateTable();
+            updateUserTable();
+            updateLastReadCardsTable();
+            alert('Tables refreshed');
+        }
+
+        window.onload = function() {
+            fetchSettings();
+            updateTable();
+            updateUserTable();
+            updateLastReadCardsTable();
+        };
+        
         function exportData() {
             fetch('/getUsers')
                 .then(response => response.json())
@@ -610,18 +686,123 @@ const char *index_html = R"rawliteral(
             document.body.removeChild(tempInput);
         }
 
-        setInterval(updateTable, 5000);
-        setInterval(updateLastReadCardsTable, 5000);
-        updateTable();
-        updateUserTable();
-        updateLastReadCardsTable();
+        // Increase polling frequency for more responsive UI
+        setInterval(updateTable, 1000);  // Every 1 second
+        setInterval(updateLastReadCardsTable, 1000);  // Every 1 second
     </script>
 </body>
 </html>
 )rawliteral";
 
-// Interrupts for card reader
-void ISR_INT0() {
+// Scan I2C bus for devices
+void scanI2C() {
+  Serial.println("Scanning I2C bus for devices...");
+  byte error, address;
+  int nDevices = 0;
+  
+  for(address = 1; address < 127; address++) {
+    Wire.beginTransmission(address);
+    error = Wire.endTransmission();
+    if (error == 0) {
+      Serial.print("I2C device found at address 0x");
+      if (address < 16) {
+        Serial.print("0");
+      }
+      Serial.print(address, HEX);
+      Serial.println();
+      nDevices++;
+    }
+  }
+  
+  if (nDevices == 0) {
+    Serial.println("No I2C devices found! Check your wiring.");
+  } else {
+    Serial.print("Found ");
+    Serial.print(nDevices);
+    Serial.println(" I2C device(s)");
+  }
+}
+
+// Configure ESP32 power and performance settings
+void configureESP32() {
+    if (DEBUG_MODE) Serial.println("Configuring ESP32 power settings...");
+    
+    // Disable automatic WiFi power saving
+    esp_wifi_set_ps(WIFI_PS_NONE);
+    
+    // Disable Bluetooth to save power and reduce interference
+    btStop();
+    
+    if (DEBUG_MODE) Serial.println("ESP32 power settings configured");
+}
+
+// Try to initialise the LCD with the correct address
+bool initLCD() {
+    if (DEBUG_MODE) Serial.println("Setting up I2C bus...");
+    Wire.begin(SDA_PIN, SCL_PIN);
+    delay(100);
+    
+    // Scan for I2C devices
+    scanI2C();
+    
+    // Try each LCD address one by one
+    if (DEBUG_MODE) Serial.println("Trying LCD address 0x27...");
+    lcd_0x27.begin();
+    lcd_0x27.backlight();
+    lcd_0x27.clear();
+    lcd_0x27.setCursor(0, 0);
+    lcd_0x27.print("Testing 0x27");
+    delay(500);
+    
+    Wire.beginTransmission(0x27);
+    if (Wire.endTransmission() == 0) {
+        if (DEBUG_MODE) Serial.println("LCD found at address 0x27");
+        lcd = &lcd_0x27;
+        return true;
+    }
+    
+    if (DEBUG_MODE) Serial.println("Trying LCD address 0x3F...");
+    lcd_0x3F.begin();
+    lcd_0x3F.backlight();
+    lcd_0x3F.clear();
+    lcd_0x3F.setCursor(0, 0);
+    lcd_0x3F.print("Testing 0x3F");
+    delay(500);
+    
+    Wire.beginTransmission(0x3F);
+    if (Wire.endTransmission() == 0) {
+        if (DEBUG_MODE) Serial.println("LCD found at address 0x3F");
+        lcd = &lcd_0x3F;
+        return true;
+    }
+    
+    if (DEBUG_MODE) Serial.println("Trying LCD address 0x20...");
+    lcd_0x20.begin();
+    lcd_0x20.backlight();
+    lcd_0x20.clear();
+    lcd_0x20.setCursor(0, 0);
+    lcd_0x20.print("Testing 0x20");
+    delay(500);
+    
+    Wire.beginTransmission(0x20);
+    if (Wire.endTransmission() == 0) {
+        if (DEBUG_MODE) Serial.println("LCD found at address 0x20");
+        lcd = &lcd_0x20;
+        return true;
+    }
+    
+    if (DEBUG_MODE) Serial.println("ERROR: LCD not found at common addresses!");
+    return false;
+}
+
+// IRAM_ATTR ensures the ISR runs from RAM, making it faster and more reliable
+void IRAM_ATTR ISR_INT0() {
+  // Track interrupt activity
+  lastInterruptTime = millis();
+  interruptCount++;
+  cardBeingRead = true;
+  
+  // Original code
   bitCount++;
   flagDone = 0;
 
@@ -633,8 +814,14 @@ void ISR_INT0() {
   weigandCounter = WEIGAND_WAIT_TIME;
 }
 
-// interrupt that happens when INT1 goes low (1 bit)
-void ISR_INT1() {
+// IRAM_ATTR for second interrupt handler as well
+void IRAM_ATTR ISR_INT1() {
+  // Track interrupt activity
+  lastInterruptTime = millis();
+  interruptCount++;
+  cardBeingRead = true;
+  
+  // Original code with bit tracking
   if (bitCount < MAX_BITS) {
     databits[bitCount] = 1;
     bitCount++;
@@ -650,6 +837,27 @@ void ISR_INT1() {
   }
 
   weigandCounter = WEIGAND_WAIT_TIME;
+}
+
+// Function to safely attach interrupts
+void attachWeigandInterrupts() {
+  if (DEBUG_MODE) Serial.println("Attaching Wiegand interrupts...");
+  if (!interruptsAttached) {
+    attachInterrupt(digitalPinToInterrupt(DATA0), ISR_INT0, FALLING);
+    attachInterrupt(digitalPinToInterrupt(DATA1), ISR_INT1, FALLING);
+    interruptsAttached = true;
+    if (DEBUG_MODE) Serial.println("Weigand interrupts attached");
+  }
+}
+
+// Function to safely detach interrupts if needed
+void detachWeigandInterrupts() {
+  if (interruptsAttached) {
+    detachInterrupt(digitalPinToInterrupt(DATA0));
+    detachInterrupt(digitalPinToInterrupt(DATA1));
+    interruptsAttached = false;
+    if (DEBUG_MODE) Serial.println("Weigand interrupts detached");
+  }
 }
 
 void saveSettingsToPreferences() {
@@ -669,21 +877,40 @@ void saveSettingsToPreferences() {
   preferences.end();
 }
 
-void loadSettingsFromPreferences() {
-  preferences.begin("settings", false);
+// Safe preferences handling with timeout
+bool loadSettingsFromPreferences() {
+  if (DEBUG_MODE) Serial.println("Loading settings from preferences...");
+  unsigned long startTime = millis();
+  
+  preferences.begin("settings", true); // Read-only mode
+  
+  if (millis() - startTime > 3000) {
+    if (DEBUG_MODE) Serial.println("WARNING: Preferences begin() taking too long!");
+    return false;
+  }
+  
   MODE = preferences.getString("MODE", "CTF");
   displayTimeout = preferences.getULong("displayTimeout", 30000);
   APMode = preferences.getBool("APMode", true);
-  ap_ssid = preferences.getString("ap_ssid","doorsim");
+  ap_ssid = preferences.getString("ap_ssid", "doorsim");
   ap_passphrase = preferences.getString("ap_passphrase", "");
-  ap_channel = preferences.getInt("ap_channel",1);
-  ssid_hidden = preferences.getInt("ssid_hidden",0);
-  spkOnInvalid = preferences.getInt("spkOnInvalid",1);
-  spkOnValid = preferences.getInt("spkOnValid",1);
-  ledValid = preferences.getInt("ledValid",1);
-  customWelcomeMessage = preferences.getString("customWelcomeMessage","");
-  welcomeMessageSelect = preferences.getString("welcomeMessageSelect","default");
+  ap_channel = preferences.getInt("ap_channel", 1);
+  ssid_hidden = preferences.getInt("ssid_hidden", 0);
+  spkOnInvalid = preferences.getInt("spkOnInvalid", 1);
+  spkOnValid = preferences.getInt("spkOnValid", 1);
+  ledValid = preferences.getInt("ledValid", 1);
+  customWelcomeMessage = preferences.getString("customWelcomeMessage", "");
+  welcomeMessageSelect = preferences.getString("welcomeMessageSelect", "default");
+  
   preferences.end();
+  
+  if (DEBUG_MODE) {
+    Serial.println("Settings loaded:");
+    Serial.print("MODE: "); Serial.println(MODE);
+    Serial.print("AP SSID: "); Serial.println(ap_ssid);
+  }
+  
+  return true;
 }
 
 void saveCredentialsToPreferences() {
@@ -742,6 +969,41 @@ void loadCredentialsFromPreferences() {
   Serial.println(validCount);
 }
 
+void setupWifi() {
+    if (DEBUG_MODE) Serial.println("Setting up WiFi in AP mode...");
+    
+    // Set explicitly to AP mode
+    WiFi.mode(WIFI_AP);
+    
+    // Disconnect from any existing connections first
+    WiFi.disconnect();
+    
+    // Add delay for stability
+    delay(100);
+    
+    // Disable any automatic reconnect attempts
+    WiFi.setAutoReconnect(false);
+    
+    // Start the AP with proper error handling
+    Serial.print("Starting WiFi AP with SSID: ");
+    Serial.println(ap_ssid);
+    
+    // Use very simple AP configuration to avoid TCP stack issues
+    if(WiFi.softAP("doorsim")) {
+        Serial.println("AP started successfully with default settings");
+        Serial.print("AP IP address: ");
+        Serial.println(WiFi.softAPIP());
+    } else {
+        Serial.println("CRITICAL ERROR: Could not start AP!");
+    }
+    
+    // Prevent WiFi from going to sleep
+    WiFi.setSleep(false);
+    
+    // Give WiFi time to stabilize
+    delay(500);
+}
+
 // Check if credential is valid
 const Credential *checkCredential(uint16_t fc, uint16_t cn) {
   for (unsigned int i = 0; i < validCount; i++) {
@@ -754,24 +1016,182 @@ const Credential *checkCredential(uint16_t fc, uint16_t cn) {
   return nullptr;
 }
 
+String centerText(const String &text, int width) {
+  int len = text.length();
+  if (len >= width) {
+    return text;
+  }
+  int padding = (width - len) / 2;
+  String spaces = "";
+  for (int i = 0; i < padding; i++) {
+    spaces += " ";
+  }
+  return spaces + text;
+}
+
+void printWelcomeMessage() {
+  if (!lcd) {
+    if (DEBUG_MODE) Serial.println("ERROR: Cannot print welcome message, LCD not initialised");
+    return;
+  }
+  
+  if (DEBUG_MODE) Serial.println("Displaying welcome message");
+  
+  if (MODE == "CTF") {
+    if (customWelcomeMessage.length() > 0) {
+      lcd->clear();
+      lcd->setCursor(0, 0);
+      lcd->print(centerText(String(customWelcomeMessage), 20));
+      lcd->setCursor(0, 2);
+      lcd->print(centerText("Present Card", 20));
+    }
+    else {
+      lcd->clear();
+      lcd->setCursor(0, 0);
+      lcd->print(centerText("CTF Mode", 20));
+      lcd->setCursor(0, 2);
+      lcd->print(centerText("Present Card", 20));
+    }
+  } else {
+    lcd->clear();
+    lcd->setCursor(0, 0);
+    lcd->print(centerText("Door Sim - Ready", 20));
+    lcd->setCursor(0, 2);
+    lcd->print(centerText("Present Card", 20));  
+  }
+}
+
+// Handle valid credentials
+void speakerOnValid() {
+  if (DEBUG_MODE) Serial.println("Playing valid card sound");
+  
+  switch (spkOnValid) {
+    case 0:
+      break;
+    
+    case 1:
+      // Nice Beeps LED
+      digitalWrite(SPK, LOW);
+      delay(100);
+      digitalWrite(SPK, HIGH);
+      delay(50);
+      digitalWrite(SPK, LOW);
+      delay(100);
+      digitalWrite(SPK, HIGH);
+      break;
+
+    case 2:
+      // Long Beeps
+      digitalWrite(SPK, LOW);
+      delay(2000);
+      digitalWrite(SPK, HIGH);
+      break;
+  }
+}
+
+void ledOnValid() {
+  if (DEBUG_MODE) Serial.println("Activating valid card LED");
+  
+  switch (ledValid) {
+    case 0:
+      break;
+    
+    case 1:
+      // Flashing LED
+      digitalWrite(LED, LOW);
+      delay(250);
+      digitalWrite(LED, HIGH);
+      delay(100);
+      digitalWrite(LED, LOW);
+      delay(250);
+      digitalWrite(LED, HIGH);
+      break;
+    
+    case 2:
+      digitalWrite(LED, LOW);
+      delay(2000);
+      digitalWrite(LED, HIGH);
+      break;
+  }
+}
+
+// Handle invalid credentials
+void lcdInvalidCredentials() {
+  if (!lcd) {
+    if (DEBUG_MODE) Serial.println("ERROR: Cannot display invalid credentials, LCD not initialised");
+    return;
+  }
+  
+  if (DEBUG_MODE) Serial.println("Displaying invalid credentials message");
+  
+  lcd->clear();
+  lcd->setCursor(0, 0);
+  lcd->print("Card Read: ");
+  lcd->setCursor(11, 0);
+  lcd->print("INVALID");
+  lcd->setCursor(0, 2);
+  lcd->print(" THIS INCIDENT WILL");
+  lcd->setCursor(0, 3);
+  lcd->print("    BE REPORTED    ");
+}
+
+void speakerOnFailure() {
+  if (DEBUG_MODE) Serial.println("Playing invalid card sound");
+  
+  switch (spkOnInvalid) {
+    case 0:
+      break;
+    
+    case 1:
+      // Sad Beeps
+      digitalWrite(SPK, LOW);
+      delay(100);
+      digitalWrite(SPK, HIGH);
+      delay(50);
+      digitalWrite(SPK, LOW);
+      delay(100);
+      digitalWrite(SPK, HIGH);
+      delay(50);
+      digitalWrite(SPK, LOW);
+      delay(100);
+      digitalWrite(SPK, HIGH);
+      delay(50);
+      digitalWrite(SPK, LOW);
+      delay(100);
+      digitalWrite(SPK, HIGH);
+      break;
+  }
+}
+
 void printCardData() {
+  Serial.println("printCardData() called with:");
+  Serial.print("Bit count: "); Serial.println(bitCount);
+  Serial.print("Facility code: "); Serial.println(facilityCode);
+  Serial.print("Card number: "); Serial.println(cardNumber);
+  Serial.print("Hex data: "); Serial.println(hexCardData);
+  Serial.print("Raw data: "); Serial.println(rawCardData);
+
   if (MODE == "CTF") {
     const Credential* result = checkCredential(facilityCode, cardNumber);
     if (result != nullptr) {
       // Valid credential found
       Serial.println("Valid credential found:");
       Serial.println("FC: " + String(result->facilityCode) + ", CN: " + String(result->cardNumber) + ", Name: " + result->name);
-      lcd.clear();
-      lcd.setCursor(0, 0);
-      lcd.print("Card Read: ");
-      lcd.setCursor(11, 0);
-      lcd.print("VALID");
-      lcd.setCursor(0, 1);
-      lcd.print("FC: " + String(result->facilityCode));
-      lcd.setCursor(9, 1);
-      lcd.print("CN:" + String(result->cardNumber));
-      lcd.setCursor(0, 3);
-      lcd.print("Name: " + String(result->name));
+      
+      if (lcd) {
+        lcd->clear();
+        lcd->setCursor(0, 0);
+        lcd->print("Card Read: ");
+        lcd->setCursor(11, 0);
+        lcd->print("VALID");
+        lcd->setCursor(0, 1);
+        lcd->print("FC: " + String(result->facilityCode));
+        lcd->setCursor(9, 1);
+        lcd->print("CN:" + String(result->cardNumber));
+        lcd->setCursor(0, 3);
+        lcd->print("Name: " + String(result->name));
+      }
+      
       ledOnValid();
       speakerOnValid();
 
@@ -804,22 +1224,24 @@ void printCardData() {
       Serial.println(rawCardData);
 
       // LCD Printing
-      lcd.clear();
-      lcd.setCursor(0, 0);
-      lcd.print("Card Read: ");
-      lcd.setCursor(11, 0);
-      lcd.print(bitCount);
-      lcd.print("bits");
-      lcd.setCursor(0, 1);
-      lcd.print("FC: ");
-      lcd.print(facilityCode);
-      lcd.setCursor(9, 1);
-      lcd.print(" CN: ");
-      lcd.print(cardNumber);
-      lcd.setCursor(0, 3);
-      lcd.print("Hex: ");
-      hexCardData.toUpperCase();
-      lcd.print(hexCardData);
+      if (lcd) {
+        lcd->clear();
+        lcd->setCursor(0, 0);
+        lcd->print("Card Read: ");
+        lcd->setCursor(11, 0);
+        lcd->print(bitCount);
+        lcd->print("bits");
+        lcd->setCursor(0, 1);
+        lcd->print("FC: ");
+        lcd->print(facilityCode);
+        lcd->setCursor(9, 1);
+        lcd->print(" CN: ");
+        lcd->print(cardNumber);
+        lcd->setCursor(0, 3);
+        lcd->print("Hex: ");
+        hexCardData.toUpperCase();
+        lcd->print(hexCardData);
+      }
 
       // Update card data status and details
       status = "Read";
@@ -827,8 +1249,27 @@ void printCardData() {
     }
   }
 
-  // Store card data
+  // Store card data - fixed to always store data regardless of mode
   if (cardDataIndex < MAX_CARDS) {
+    Serial.print("Storing card at index: ");
+    Serial.println(cardDataIndex);
+    
+    cardDataArray[cardDataIndex].bitCount = bitCount;
+    cardDataArray[cardDataIndex].facilityCode = facilityCode;
+    cardDataArray[cardDataIndex].cardNumber = cardNumber;
+    cardDataArray[cardDataIndex].hexCardData = hexCardData;
+    cardDataArray[cardDataIndex].rawCardData = rawCardData;
+    cardDataArray[cardDataIndex].status = status;
+    cardDataArray[cardDataIndex].details = details;
+    cardDataIndex++;
+    
+    Serial.print("Card stored. New cardDataIndex: ");
+    Serial.println(cardDataIndex);
+  } else {
+    // If we reached the max cards, start overwriting from the beginning
+    Serial.println("Card storage full, resetting to start overwriting from beginning");
+    cardDataIndex = 0;
+    
     cardDataArray[cardDataIndex].bitCount = bitCount;
     cardDataArray[cardDataIndex].facilityCode = facilityCode;
     cardDataArray[cardDataIndex].cardNumber = cardNumber;
@@ -844,103 +1285,10 @@ void printCardData() {
   displayingCard = true;
 }
 
-// Functions to handle invalid credentials
-void lcdInvalidCredentials() {
-  lcd.clear();
-  lcd.setCursor(0, 0);
-  lcd.print("Card Read: ");
-  lcd.setCursor(11, 0);
-  lcd.print("INVALID");
-  lcd.setCursor(0, 2);
-  lcd.print(" THIS INCIDENT WILL");
-  lcd.setCursor(0, 3);
-  lcd.print("    BE REPORTED    ");
-}
-
-
-void speakerOnFailure() {
-  switch (spkOnInvalid) {
-    case 0:
-      break;
-    
-    case 1:
-      // Sad Beeps
-      digitalWrite(SPK, LOW);
-      delay(100);
-      digitalWrite(SPK, HIGH);
-      delay(50);
-      digitalWrite(SPK, LOW);
-      delay(100);
-      digitalWrite(SPK, HIGH);
-      delay(50);
-      digitalWrite(SPK, LOW);
-      delay(100);
-      digitalWrite(SPK, HIGH);
-      delay(50);
-      digitalWrite(SPK, LOW);
-      delay(100);
-      digitalWrite(SPK, HIGH);
-      break;
-
-  }
-}
-
-// Functions to handle valid credentials
-void speakerOnValid() {
-  switch (spkOnValid) {
-    case 0 :
-      break;
-    
-    case 1:
-      // Nice Beeps LED
-      digitalWrite(SPK, LOW);
-      delay(100);
-      digitalWrite(SPK, HIGH);
-      delay(50);
-      digitalWrite(SPK, LOW);
-      delay(100);
-      digitalWrite(SPK, HIGH);
-      break;
-
-    case 2:
-      // Long Beeps
-      digitalWrite(SPK, LOW);
-      delay(2000);
-      digitalWrite(SPK, HIGH);
-      break;
-    }
-}
-
-void ledOnValid() {
-  switch (ledValid) {
-    case 0:
-      break;
-    
-    case 1:
-      // Flashing LED
-      digitalWrite(LED, LOW);
-      delay(250);
-      digitalWrite(LED, HIGH);
-      delay(100);
-      digitalWrite(LED, LOW);
-      delay(250);
-      digitalWrite(LED, HIGH);
-      break;
-
-    
-    case 2:
-      digitalWrite(LED, LOW);
-      delay(2000);
-      digitalWrite(LED, HIGH);
-      break;
-
-  }
-}
-
 // Process hid cards
 unsigned long decodeHIDFacilityCode(unsigned int start, unsigned int end) {
   unsigned long HIDFacilityCode = 0;
-  for (unsigned int i = start; i < end; i++) {
+  for (unsigned int i = start; i < end && i < bitCount; i++) {
     HIDFacilityCode = (HIDFacilityCode << 1) | databits[i];
   }
   return HIDFacilityCode;
@@ -948,7 +1296,7 @@ unsigned long decodeHIDFacilityCode(unsigned int start, unsigned int end) {
 
 unsigned long decodeHIDCardNumber(unsigned int start, unsigned int end) {
   unsigned long HIDCardNumber = 0;
-  for (unsigned int i = start; i < end; i++) {
+  for (unsigned int i = start; i < end && i < bitCount; i++) {
     HIDCardNumber = (HIDCardNumber << 1) | databits[i];
   }
   return HIDCardNumber;
@@ -1079,22 +1427,44 @@ void processHIDCard() {
 
     default:
       Serial.println("[-] Unsupported bitCount for HID card");
-      return;
+      facilityCode = 0;
+      cardNumber = 0;
+      // Default values to prevent issues
+      cardChunk1Offset = 8;
+      bitHolderOffset = 14;
+      cardChunk2Offset = 10;
+      break;
   }
 
   setCardChunkBits(cardChunk1Offset, bitHolderOffset, cardChunk2Offset);
   hexCardData = String(cardChunk1, HEX) + prefixPad(String(cardChunk2, HEX), '0', 6);
-  //hexCardData = String(cardChunk1, HEX) + String(cardChunk2, HEX);
 }
 
 void processCardData() {
+  // First, build the raw data string
+  Serial.println("Processing card data...");
+  Serial.print("Bit count: "); Serial.println(bitCount);
+  
   rawCardData = "";
-  for (unsigned int i = 0; i < bitCount; i++) {
+  for (unsigned int i = 0; i < bitCount && i < MAX_BITS; i++) {
     rawCardData += String(databits[i]);
   }
-
+  
+  Serial.print("Raw data: "); Serial.println(rawCardData);
+  
+  // Process the card data based on the bit count
   if (bitCount >= 26 && bitCount <= 96) {
+    Serial.println("Valid bit count range, processing HID card...");
     processHIDCard();
+    Serial.print("Processed - FC: "); Serial.print(facilityCode);
+    Serial.print(", CN: "); Serial.print(cardNumber);
+    Serial.print(", Hex: "); Serial.println(hexCardData);
+  } else {
+    Serial.print("Invalid bit count: "); Serial.println(bitCount);
+    // Set default values
+    facilityCode = 0;
+    cardNumber = 0;
+    hexCardData = "Unknown";
   }
 }
 
@@ -1106,6 +1476,7 @@ void clearDatabits() {
 
 // reset variables and prepare for the next card read
 void cleanupCardData() {
+  Serial.println("Cleaning up card data...");
   rawCardData = "";
   hexCardData = "";
   bitCount = 0;
@@ -1117,54 +1488,78 @@ void cleanupCardData() {
   cardChunk2 = 0;
   status = "";
   details = "";
-
+  cardBeingRead = false;
 }
 
-bool allBitsAreOnes() {
-  for (int i = 0; i < MAX_BITS; i++) {
-    if (databits[i] != 0xFF) {  // Check if each byte is not equal to 0xFF
-      return false;             // If any byte is not 0xFF, not all bits are ones
+// Function to process a card immediately after it's fully read
+void processCardNow() {
+  if (bitCount > 0) {
+    Serial.println("Processing card immediately...");
+    
+    if (!shouldSkipProcessing()) {
+      processCardData();
+      
+      if ((bitCount >= 26 && bitCount <= 36) || bitCount == 96) {
+        Serial.println("Valid bit count, printing card data");
+        printCardData();
+        printAllCardData();
+        
+        // Immediately force a refresh of the web interface by setting a flag
+        // that will be checked in the main loop
+        lastCardTime = millis();
+        displayingCard = true;
+      } else {
+        Serial.print("Invalid bit count: ");
+        Serial.println(bitCount);
+      }
+    } else {
+      Serial.println("Invalid data detected, skipping processing");
     }
+    
+    // Clear card data for next read
+    cleanupCardData();
+    clearDatabits();
   }
-  return true;  // All bytes were 0xFF, so all bits are ones
 }
 
-String centerText(const String &text, int width) {
-  int len = text.length();
-  if (len >= width) {
-    return text;
+// FIXED: This function was checking if all bytes in databits are 0xFF,
+// which is incorrect. It should check if we have valid data.
+bool shouldSkipProcessing() {
+  // Skip processing if bit count is invalid
+  if (bitCount == 0 || bitCount > MAX_BITS) {
+    Serial.println("Skipping processing - invalid bit count");
+    return true;
   }
-  int padding = (width - len) / 2;
-  String spaces = "";
-  for (int i = 0; i < padding; i++) {
-    spaces += " ";
-  }
-  return spaces + text;
-}
-
-void printWelcomeMessage() {
-  if (MODE == "CTF") {
-    if (customWelcomeMessage != NULL) {
-      lcd.clear();
-      lcd.setCursor(0, 0);
-      lcd.print(centerText(String(customWelcomeMessage), 20));
-      lcd.setCursor(0, 2);
-      lcd.print(centerText("Present Card", 20));
+  
+  // Check if all bits are 1 (which would be unusual for valid card data)
+  bool allOnes = true;
+  for (unsigned int i = 0; i < bitCount; i++) {
+    if (databits[i] != 1) {
+      allOnes = false;
+      break;
     }
-    else {
-      lcd.clear();
-      lcd.setCursor(0, 0);
-      lcd.print(centerText("CTF Mode", 20));
-      lcd.setCursor(0, 2);
-      lcd.print(centerText("Present Card", 20));
-    }
-  } else {
-    lcd.clear();
-    lcd.setCursor(0, 0);
-    lcd.print(centerText("Door Sim - Ready", 20));
-    lcd.setCursor(0, 2);
-    lcd.print(centerText("Present Card", 20));  
   }
+  
+  if (allOnes) {
+    Serial.println("Skipping processing - all bits are 1");
+    return true;
+  }
+  
+  // Check if all bits are 0 (which would be unusual for valid card data)
+  bool allZeros = true;
+  for (unsigned int i = 0; i < bitCount; i++) {
+    if (databits[i] != 0) {
+      allZeros = false;
+      break;
+    }
+  }
+  
+  if (allZeros) {
+    Serial.println("Skipping processing - all bits are 0");
+    return true;
+  }
+  
+  return false;
 }
 
 void updateDisplay() {
@@ -1191,170 +1586,149 @@ void printAllCardData() {
   }
 }
 
-void setupWifi() {
-    WiFi.softAP(ap_ssid, ap_passphrase, ap_channel, ssid_hidden);
+// Web server handler functions
+void handleRoot() {
+    server.send(200, "text/html", index_html);
 }
 
-void setup() {
-  Serial.begin(115200);
-  lcd.begin();
-
-  pinMode(DATA0, INPUT);
-  pinMode(DATA1, INPUT);
-
-  pinMode(LED, OUTPUT);
-  pinMode(SPK, OUTPUT);
-
-  pinMode(RELAY1, OUTPUT);
-  pinMode(RELAY2, OUTPUT);
-
-  digitalWrite(LED, HIGH);
-  digitalWrite(SPK, HIGH);
-
-  attachInterrupt(DATA0, ISR_INT0, FALLING);
-  attachInterrupt(DATA1, ISR_INT1, FALLING);
-
-  weigandCounter = WEIGAND_WAIT_TIME;
-  for (unsigned char i = 0; i < MAX_BITS; i++) {
-    lastWrittenDatabits[i] = 0;
-  }
-
-  loadSettingsFromPreferences();
-  loadCredentialsFromPreferences();
-
-  setupWifi();
-
-  printWelcomeMessage();
-
-  server.on("/", HTTP_GET, [](AsyncWebServerRequest *request) {
-    request->send_P(200, "text/html", index_html);
-  });
-
-  server.on("/getCards", HTTP_GET, [](AsyncWebServerRequest *request) {
-      DynamicJsonDocument doc(4096);
-      JsonArray cards = doc.to<JsonArray>();
-      for (int i = 0; i < cardDataIndex; i++) {
-          JsonObject card = cards.createNestedObject();
-          card["bitCount"] = cardDataArray[i].bitCount;
-          card["facilityCode"] = cardDataArray[i].facilityCode;
-          card["cardNumber"] = cardDataArray[i].cardNumber;
-          card["hexCardData"] = cardDataArray[i].hexCardData;
-          card["rawCardData"] = cardDataArray[i].rawCardData;
-          card["status"] = cardDataArray[i].status;
-          card["details"] = cardDataArray[i].details;
-      }
-      String response;
-      serializeJson(doc, response);
-      request->send(200, "application/json", response);
-  });
-
-  server.on("/getUsers", HTTP_GET, [](AsyncWebServerRequest *request) {
-      DynamicJsonDocument doc(4096);
-      JsonArray users = doc.to<JsonArray>();
-      for (int i = 0; i < validCount; i++) {
-          JsonObject user = users.createNestedObject();
-          user["facilityCode"] = credentials[i].facilityCode;
-          user["cardNumber"] = credentials[i].cardNumber;
-          user["name"] = credentials[i].name;
-      }
-      String response;
-      serializeJson(doc, response);
-      request->send(200, "application/json", response);
-  });
-
-  server.on("/getSettings", HTTP_GET, [](AsyncWebServerRequest *request) {
-      DynamicJsonDocument doc(2048);
-      doc["mode"] = MODE;
-      doc["displayTimeout"] = displayTimeout;
-      doc["apSsid"] = ap_ssid;
-      doc["apPassphrase"] = ap_passphrase;
-      doc["ssidHidden"] = ssid_hidden;
-      doc["apChannel"] = ap_channel;
-      doc["welcomeMessageSelect"] = customWelcomeMessage.length() > 0 ? "custom" : "default";
-      doc["customMessage"] = customWelcomeMessage;
-      doc["ledValid"] = ledValid;
-      doc["spkOnValid"] = spkOnValid;
-      doc["spkOnInvalid"] = spkOnInvalid;
-      String response;
-      serializeJson(doc, response);
-      request->send(200, "application/json", response);
-  });
-
-  AsyncCallbackJsonWebHandler* handler = new AsyncCallbackJsonWebHandler("/saveSettings", [](AsyncWebServerRequest *request, JsonVariant &json) {
-      JsonObject jsonObj = json.as<JsonObject>();
-
-      // Parse the JSON and update settings
-      MODE = jsonObj["mode"] | "CTF";
-      displayTimeout = jsonObj["displayTimeout"] | 30000;
-      ap_ssid = jsonObj["apSsid"] | "doorsim";
-      ap_passphrase = jsonObj["apPassphrase"] | "";
-      ap_channel = jsonObj["apChannel"] | 1;
-      ssid_hidden = jsonObj["ssidHidden"] | 0;
-      welcomeMessageSelect = jsonObj["welcomeMessageSelect"] | "default";
-      customWelcomeMessage = jsonObj["customMessage"] | "";
-      spkOnInvalid = jsonObj["spkOnInvalid"] | 1;
-      spkOnValid = jsonObj["spkOnValid"] | 1;
-      ledValid = jsonObj["ledValid"] | 1;
-
-      saveSettingsToPreferences();
-      setupWifi();
-
-      request->send(200, "application/json", "{\"status\":\"success\"}");
-  });
-  server.addHandler(handler);
-
-  server.on("/addCard", HTTP_GET, [](AsyncWebServerRequest *request) {
-    if (validCount < MAX_CREDENTIALS) {
-      if (request->hasParam("facilityCode") && request->hasParam("cardNumber") && request->hasParam("name")) {
-        String facilityCodeStr = request->getParam("facilityCode")->value();
-        String cardNumberStr = request->getParam("cardNumber")->value();
-        String name = request->getParam("name")->value();
-
-        credentials[validCount].facilityCode = facilityCodeStr.toInt();
-        credentials[validCount].cardNumber = cardNumberStr.toInt();
-        strncpy(credentials[validCount].name, name.c_str(), sizeof(credentials[validCount].name) - 1);
-        credentials[validCount].name[sizeof(credentials[validCount].name) - 1] = '\0';
-        validCount++;
-        saveCredentialsToPreferences();
-        request->send(200, "text/plain", "Card added successfully");
-      } else {
-        request->send(400, "text/plain", "Missing parameters");
-      }
-    } else {
-      request->send(500, "text/plain", "Max number of credentials reached");
+void handleGetCards() {
+    Serial.println("handleGetCards() called");
+    Serial.print("cardDataIndex: ");
+    Serial.println(cardDataIndex);
+    
+    JsonDocument doc; // Using non-deprecated JsonDocument
+    JsonArray cards = doc.to<JsonArray>();
+    
+    for (int i = 0; i < cardDataIndex; i++) {
+        JsonObject card = cards.add<JsonObject>(); // Using non-deprecated method
+        card["bitCount"] = cardDataArray[i].bitCount;
+        card["facilityCode"] = cardDataArray[i].facilityCode;
+        card["cardNumber"] = cardDataArray[i].cardNumber;
+        card["hexCardData"] = cardDataArray[i].hexCardData;
+        card["rawCardData"] = cardDataArray[i].rawCardData;
+        card["status"] = cardDataArray[i].status;
+        card["details"] = cardDataArray[i].details;
     }
-  });
+    
+    String response;
+    serializeJson(doc, response);
+    server.send(200, "application/json", response);
+}
 
-  server.on("/deleteCard", HTTP_GET, [](AsyncWebServerRequest *request) {
-    if (request->hasParam("index")) {
-      int index = request->getParam("index")->value().toInt();
-      if (index >= 0 && index < validCount) {
-        for (int i = index; i < validCount - 1; i++) {
-          credentials[i] = credentials[i + 1];
-        }
-        validCount--;
-        saveCredentialsToPreferences();
-        request->send(200, "text/plain", "Card deleted successfully");
-      } else {
-        request->send(400, "text/plain", "Invalid index");
-      }
-    } else {
-      request->send(400, "text/plain", "Missing index parameter");
-    }
-  });
-
-  server.on("/exportData", HTTP_GET, [](AsyncWebServerRequest *request) {
-    DynamicJsonDocument doc(4096);
-    JsonArray users = doc.createNestedArray("users");
+void handleGetUsers() {
+    JsonDocument doc;
+    JsonArray users = doc.to<JsonArray>();
     for (int i = 0; i < validCount; i++) {
-        JsonObject user = users.createNestedObject();
+        JsonObject user = users.add<JsonObject>();
         user["facilityCode"] = credentials[i].facilityCode;
         user["cardNumber"] = credentials[i].cardNumber;
         user["name"] = credentials[i].name;
     }
-    JsonArray cards = doc.createNestedArray("cards");
+    String response;
+    serializeJson(doc, response);
+    server.send(200, "application/json", response);
+}
+
+void handleGetSettings() {
+    JsonDocument doc;
+    doc["mode"] = MODE;
+    doc["displayTimeout"] = displayTimeout;
+    doc["apSsid"] = ap_ssid;
+    doc["apPassphrase"] = ap_passphrase;
+    doc["ssidHidden"] = ssid_hidden;
+    doc["apChannel"] = ap_channel;
+    doc["welcomeMessageSelect"] = welcomeMessageSelect;
+    doc["customMessage"] = customWelcomeMessage;
+    doc["ledValid"] = ledValid;
+    doc["spkOnValid"] = spkOnValid;
+    doc["spkOnInvalid"] = spkOnInvalid;
+    String response;
+    serializeJson(doc, response);
+    server.send(200, "application/json", response);
+}
+
+void handleSaveSettings() {
+    if (server.hasArg("plain")) {
+        String json = server.arg("plain");
+        JsonDocument doc;
+        DeserializationError error = deserializeJson(doc, json);
+        if (!error) {
+            // Parse the JSON and update settings
+            MODE = doc["mode"] | "CTF";
+            displayTimeout = doc["displayTimeout"] | 30000;
+            ap_ssid = doc["apSsid"] | "doorsim";
+            ap_passphrase = doc["apPassphrase"] | "";
+            ap_channel = doc["apChannel"] | 1;
+            ssid_hidden = doc["ssidHidden"] | 0;
+            welcomeMessageSelect = doc["welcomeMessageSelect"] | "default";
+            customWelcomeMessage = doc["customMessage"] | "";
+            spkOnInvalid = doc["spkOnInvalid"] | 1;
+            spkOnValid = doc["spkOnValid"] | 1;
+            ledValid = doc["ledValid"] | 1;
+            
+            saveSettingsToPreferences();
+            server.send(200, "application/json", "{\"status\":\"success\"}");
+        } else {
+            server.send(400, "application/json", "{\"status\":\"error\",\"message\":\"Invalid JSON\"}");
+        }
+    } else {
+        server.send(400, "application/json", "{\"status\":\"error\",\"message\":\"No data\"}");
+    }
+}
+
+void handleAddCard() {
+    if (validCount < MAX_CREDENTIALS) {
+        if (server.hasArg("facilityCode") && server.hasArg("cardNumber") && server.hasArg("name")) {
+            String facilityCodeStr = server.arg("facilityCode");
+            String cardNumberStr = server.arg("cardNumber");
+            String name = server.arg("name");
+            
+            credentials[validCount].facilityCode = facilityCodeStr.toInt();
+            credentials[validCount].cardNumber = cardNumberStr.toInt();
+            strncpy(credentials[validCount].name, name.c_str(), sizeof(credentials[validCount].name) - 1);
+            credentials[validCount].name[sizeof(credentials[validCount].name) - 1] = '\0';
+            validCount++;
+            
+            saveCredentialsToPreferences();
+            server.send(200, "text/plain", "Card added successfully");
+        } else {
+            server.send(400, "text/plain", "Missing parameters");
+        }
+    } else {
+        server.send(500, "text/plain", "Max number of credentials reached");
+    }
+}
+
+void handleDeleteCard() {
+    if (server.hasArg("index")) {
+        int index = server.arg("index").toInt();
+        if (index >= 0 && index < validCount) {
+            for (int i = index; i < validCount - 1; i++) {
+                credentials[i] = credentials[i + 1];
+            }
+            validCount--;
+            saveCredentialsToPreferences();
+            server.send(200, "text/plain", "Card deleted successfully");
+        } else {
+            server.send(400, "text/plain", "Invalid index");
+        }
+    } else {
+        server.send(400, "text/plain", "Missing index parameter");
+    }
+}
+
+void handleExportData() {
+    JsonDocument doc;
+    JsonArray users = doc["users"].to<JsonArray>();
+    for (int i = 0; i < validCount; i++) {
+        JsonObject user = users.add<JsonObject>();
+        user["facilityCode"] = credentials[i].facilityCode;
+        user["cardNumber"] = credentials[i].cardNumber;
+        user["name"] = credentials[i].name;
+    }
+    JsonArray cards = doc["cards"].to<JsonArray>();
     for (int i = 0; i < cardDataIndex; i++) {
-        JsonObject card = cards.createNestedObject();
+        JsonObject card = cards.add<JsonObject>();
         card["bitCount"] = cardDataArray[i].bitCount;
         card["facilityCode"] = cardDataArray[i].facilityCode;
         card["cardNumber"] = cardDataArray[i].cardNumber;
@@ -1363,34 +1737,199 @@ void setup() {
     }
     String response;
     serializeJson(doc, response);
-    request->send(200, "application/json", response);
-  });
+    server.send(200, "application/json", response);
+}
 
-  server.begin();
+void setupWebServer() {
+    if (DEBUG_MODE) Serial.println("Setting up full web server...");
+    
+    // Main page
+    server.on("/", HTTP_GET, handleRoot);
+    
+    // API endpoints
+    server.on("/getCards", HTTP_GET, handleGetCards);
+    server.on("/getUsers", HTTP_GET, handleGetUsers);
+    server.on("/getSettings", HTTP_GET, handleGetSettings);
+    server.on("/saveSettings", HTTP_POST, handleSaveSettings);
+    server.on("/addCard", HTTP_GET, handleAddCard);
+    server.on("/deleteCard", HTTP_GET, handleDeleteCard);
+    server.on("/exportData", HTTP_GET, handleExportData);
+    
+    // Start the server
+    server.begin();
+    
+    if (DEBUG_MODE) Serial.println("Full web server started");
+}
 
-  digitalWrite(RELAY1, HIGH);
+// Debug interrupt status
+void debugInterrupts() {
+    static unsigned long lastDebugTime = 0;
+    const unsigned long debugInterval = 5000; // 5 seconds
+    
+    if (millis() - lastDebugTime >= debugInterval) {
+        lastDebugTime = millis();
+        
+        Serial.print("Interrupt status - Count: ");
+        Serial.print(interruptCount);
+        Serial.print(", Last interrupt: ");
+        Serial.print(millis() - lastInterruptTime);
+        Serial.println("ms ago");
+        
+        // Reset interrupt count for next period
+        interruptCount = 0;
+    }
+}
 
+void setup() {
+    // Record start time for timeout detection
+    setupStartTime = millis();
+    
+    // Initialise serial communication first for debugging
+    Serial.begin(115200);
+    
+    // Wait a moment for serial to connect
+    delay(1000);
+    
+    Serial.println("\n\n");
+    Serial.println("==============================================");
+    Serial.println("ESP32 Door Simulator - FIXED VERSION");
+    Serial.println("==============================================");
+    Serial.println("Starting initialisation process...");
+    
+    // Configure ESP32 power settings
+    configureESP32();
+    
+    // Set pin modes
+    Serial.println("Setting up I/O pins...");
+    pinMode(DATA0, INPUT);
+    pinMode(DATA1, INPUT);
+    pinMode(LED, OUTPUT);
+    pinMode(SPK, OUTPUT);
+    pinMode(RELAY1, OUTPUT);
+    pinMode(RELAY2, OUTPUT);
+    
+    // Set initial states
+    digitalWrite(LED, HIGH);
+    digitalWrite(SPK, HIGH);
+    digitalWrite(RELAY1, HIGH);
+    Serial.println("I/O pins configured");
+    
+    // initialise LCD
+    bool lcdinitialised = initLCD();
+    if (lcdinitialised && lcd) {
+        Serial.println("LCD initialised successfully");
+        lcd->clear();
+        lcd->setCursor(0, 0);
+        lcd->print("initialising...");
+    }
+    else {
+        Serial.println("WARNING: Failed to initialise LCD");
+        // Continue anyway for debugging
+    }
+    
+    // Try to load settings, but don't stop if it fails
+    Serial.println("Loading settings phase...");
+    if (!loadSettingsFromPreferences()) {
+        Serial.println("WARNING: Failed to load settings from preferences");
+        Serial.println("Using default settings");
+    }
+    
+    // Load credentials
+    Serial.println("Loading credentials phase...");
+    loadCredentialsFromPreferences();
+    
+    // Setup WiFi - very important for stability
+    Serial.println("WiFi setup phase...");
+    setupWifi();
+    
+    // Weigand initialisation
+    Serial.println("initialising Wiegand reader...");
+    weigandCounter = WEIGAND_WAIT_TIME;
+    
+    // Setup web server only after WiFi is up
+    Serial.println("Web server setup phase...");
+    setupWebServer();
+    
+    // Now that everything else is set up, attach interrupts
+    Serial.println("Attaching card reader interrupts...");
+    attachWeigandInterrupts();
+    
+    // Show welcome message if LCD is working
+    if (lcd) {
+        Serial.println("Displaying welcome message...");
+        printWelcomeMessage();
+    }
+    
+    // Setup completion
+    Serial.println("==============================================");
+    Serial.println("Setup completed successfully!");
+    Serial.println("System is now running in " + MODE + " mode");
+    Serial.println("Connect to WiFi SSID: doorsim");
+    Serial.println("Access the web interface at: " + WiFi.softAPIP().toString());
+    Serial.println("==============================================");
 }
 
 void loop() {
-  updateDisplay();
-
-  if (!flagDone) {
-    if (--weigandCounter == 0)
-      flagDone = 1;
-  }
-
-  if (bitCount > 0 && flagDone) {
-    if (!allBitsAreOnes()) {
-      processCardData();
-      if (bitCount >= 26 && bitCount <= 36 || bitCount == 96) {
-        printCardData();
-        printAllCardData();
-      }
+    // Check if we're in setup but it's taking too long
+    if (millis() - setupStartTime < SETUP_TIMEOUT && !lcd) {
+        Serial.println("Still waiting for initialisation to complete...");
+        delay(1000);
+        return;
     }
-
-
-    cleanupCardData();
-    clearDatabits();
-  }
+    
+    // Handle HTTP requests
+    server.handleClient();
+    
+    // Debug interrupt status periodically
+    debugInterrupts();
+    
+    // Check if WiFi is still up (every 30 seconds)
+    if (millis() - lastWifiCheck >= wifiCheckInterval) {
+        lastWifiCheck = millis();
+        
+        IPAddress apIP = WiFi.softAPIP();
+        if (apIP == IPAddress(0, 0, 0, 0)) {
+            Serial.println("WiFi AP is down, restarting...");
+            setupWifi();
+        } else {
+            int stationCount = WiFi.softAPgetStationNum();
+            if (DEBUG_MODE) {
+                Serial.print("WiFi AP is up, IP: ");
+                Serial.print(apIP.toString());
+                Serial.print(", Connected stations: ");
+                Serial.println(stationCount);
+            }
+        }
+    }
+    
+    // Update display if needed
+    updateDisplay();
+    
+    // Handle Weigand card reader data
+    if (!flagDone) {
+        if (--weigandCounter == 0) {
+            flagDone = 1;
+            
+            if (cardBeingRead) {
+                Serial.println("Card read complete, flagDone set");
+                Serial.print("Bit count: ");
+                Serial.println(bitCount);
+                
+                // Process the card immediately when read is complete
+                processCardNow();
+            }
+        }
+    }
+    
+    if (bitCount > 0 && flagDone) {
+        // This is an additional backup to ensure card data is processed
+        // but generally we should already have processed via processCardNow
+        Serial.print("Backup card processing with bit count: ");
+        Serial.println(bitCount);
+        
+        processCardNow();
+    }
+    
+    // Keep the system responsive
+    delay(10);
 }
