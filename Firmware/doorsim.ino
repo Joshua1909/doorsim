@@ -97,6 +97,8 @@ int ledValid = 1;
 // Custom Display Message
 String customWelcomeMessage = "";
 String welcomeMessageSelect = "default";
+String customFlagMessage = "";
+String flagMessageSelect = "default";
 
 // decoded facility code and card code
 unsigned long facilityCode = 0;
@@ -174,7 +176,7 @@ bool shouldSkipProcessing();
 void processCardNow();
 void printAllCardData();
 const Credential *checkCredential(uint16_t fc, uint16_t cn);
-String centerText(const String &text, int width);
+String centreText(const String &text, int width);
 String prefixPad(const String &in, const char c, const size_t len);
 
 // HTML for the web interface
@@ -247,6 +249,9 @@ const char *index_html = R"rawliteral(
         .inputRow input {
             width: 100%;
             box-sizing: border-box;
+        }
+        #customFlagMessage {
+            margin-top: 10px;
         }
     </style>
 </head>
@@ -351,6 +356,16 @@ const char *index_html = R"rawliteral(
             <div id="customWelcomeMessage">
                 <label for="customMessage">Custom Message:</label>
                 <input type="text" id="customMessage" maxlength="20">
+            </div>
+            <br><br>
+            <label for="flagMessageSelect">Flag Message (for valid cards):</label>
+            <select id="flagMessageSelect" onchange="toggleFlagMessage()">
+                <option value="default">Default ("VALID")</option>
+                <option value="custom">Custom Flag</option>
+            </select>
+            <div id="customFlagMessage">
+                <label for="customFlag">Custom Flag:</label>
+                <input type="text" id="customFlag" maxlength="20" placeholder="flag{example}">
             </div>
             <br><br>
             <div>
@@ -552,6 +567,16 @@ const char *index_html = R"rawliteral(
             }
         }
 
+        function toggleFlagMessage() {
+            const flagMessageSelect = document.getElementById('flagMessageSelect').value;
+            const customFlagInput = document.getElementById('customFlag');
+            if (flagMessageSelect === 'custom') {
+                customFlagInput.disabled = false;
+            } else {
+                customFlagInput.disabled = true;
+            }
+        }
+
         function updateSettingsUI(settings) {
             document.getElementById('modeSelect').value = settings.mode;
             document.getElementById('timeoutSelect').value = settings.displayTimeout;
@@ -561,10 +586,13 @@ const char *index_html = R"rawliteral(
             document.getElementById('ap_channel').value = settings.apChannel;
             document.getElementById('welcomeMessageSelect').value = settings.welcomeMessageSelect;
             document.getElementById('customMessage').value = settings.customMessage;
+            document.getElementById('flagMessageSelect').value = settings.flagMessageSelect;
+            document.getElementById('customFlag').value = settings.customFlag;
             document.getElementById('ledValid').value = settings.ledValid;
             document.getElementById('spkOnValid').value = settings.spkOnValid;
             document.getElementById('spkOnInvalid').value = settings.spkOnInvalid;
             toggleWelcomeMessage();
+            toggleFlagMessage();
         }
 
         function saveSettings() {
@@ -576,6 +604,8 @@ const char *index_html = R"rawliteral(
             const apChannel = document.getElementById('ap_channel').value;
             const welcomeMessageSelect = document.getElementById('welcomeMessageSelect').value;
             const customMessage = document.getElementById('customMessage').value;
+            const flagMessageSelect = document.getElementById('flagMessageSelect').value;
+            const customFlag = document.getElementById('customFlag').value;
             const ledValid = document.getElementById('ledValid').value;
             const spkOnValid = document.getElementById('spkOnValid').value;
             const spkOnInvalid = document.getElementById('spkOnInvalid').value;
@@ -589,6 +619,8 @@ const char *index_html = R"rawliteral(
                 apChannel: parseInt(apChannel),
                 welcomeMessageSelect: welcomeMessageSelect,
                 customMessage: customMessage,
+                flagMessageSelect: flagMessageSelect,
+                customFlag: customFlag,
                 ledValid: parseInt(ledValid),
                 spkOnValid: parseInt(spkOnValid),
                 spkOnInvalid: parseInt(spkOnInvalid)
@@ -632,6 +664,9 @@ const char *index_html = R"rawliteral(
             updateTable();
             updateUserTable();
             updateLastReadCardsTable();
+            // Initialize the disabled state for custom inputs
+            toggleWelcomeMessage();
+            toggleFlagMessage();
         };
         
         function exportData() {
@@ -874,6 +909,8 @@ void saveSettingsToPreferences() {
   preferences.putInt("ledValid", ledValid);
   preferences.putString("customWelcomeMessage", customWelcomeMessage);
   preferences.putString("welcomeMessageSelect", welcomeMessageSelect);
+  preferences.putString("customFlagMessage", customFlagMessage);
+  preferences.putString("flagMessageSelect", flagMessageSelect);
   preferences.end();
 }
 
@@ -901,6 +938,8 @@ bool loadSettingsFromPreferences() {
   ledValid = preferences.getInt("ledValid", 1);
   customWelcomeMessage = preferences.getString("customWelcomeMessage", "");
   welcomeMessageSelect = preferences.getString("welcomeMessageSelect", "default");
+  customFlagMessage = preferences.getString("customFlagMessage", "");
+  flagMessageSelect = preferences.getString("flagMessageSelect", "default");
   
   preferences.end();
   
@@ -987,14 +1026,39 @@ void setupWifi() {
     // Start the AP with proper error handling
     Serial.print("Starting WiFi AP with SSID: ");
     Serial.println(ap_ssid);
+    Serial.print("Password: ");
+    Serial.println(ap_passphrase.length() > 0 ? "[SET]" : "[OPEN]");
+    Serial.print("Channel: ");
+    Serial.println(ap_channel);
+    Serial.print("Hidden: ");
+    Serial.println(ssid_hidden ? "YES" : "NO");
     
-    // Use very simple AP configuration to avoid TCP stack issues
-    if(WiFi.softAP("doorsim")) {
-        Serial.println("AP started successfully with default settings");
+    // Use configured AP settings
+    bool success = false;
+    if (ap_passphrase.length() > 0) {
+        // Start AP with password
+        success = WiFi.softAP(ap_ssid.c_str(), ap_passphrase.c_str(), ap_channel, ssid_hidden);
+    } else {
+        // Start AP without password (open network)
+        success = WiFi.softAP(ap_ssid.c_str(), NULL, ap_channel, ssid_hidden);
+    }
+    
+    if (success) {
+        Serial.println("AP started successfully with configured settings");
         Serial.print("AP IP address: ");
         Serial.println(WiFi.softAPIP());
+        Serial.print("SSID: ");
+        Serial.println(WiFi.softAPSSID());
+        Serial.print("Security: ");
+        Serial.println(ap_passphrase.length() > 0 ? "WPA2" : "Open");
     } else {
-        Serial.println("CRITICAL ERROR: Could not start AP!");
+        Serial.println("CRITICAL ERROR: Could not start AP with configured settings!");
+        Serial.println("Falling back to default open network...");
+        if(WiFi.softAP("doorsim")) {
+            Serial.println("Fallback AP started successfully");
+        } else {
+            Serial.println("CRITICAL ERROR: Even fallback AP failed!");
+        }
     }
     
     // Prevent WiFi from going to sleep
@@ -1016,7 +1080,7 @@ const Credential *checkCredential(uint16_t fc, uint16_t cn) {
   return nullptr;
 }
 
-String centerText(const String &text, int width) {
+String centreText(const String &text, int width) {
   int len = text.length();
   if (len >= width) {
     return text;
@@ -1041,23 +1105,23 @@ void printWelcomeMessage() {
     if (customWelcomeMessage.length() > 0) {
       lcd->clear();
       lcd->setCursor(0, 0);
-      lcd->print(centerText(String(customWelcomeMessage), 20));
+      lcd->print(centreText(String(customWelcomeMessage), 20));
       lcd->setCursor(0, 2);
-      lcd->print(centerText("Present Card", 20));
+      lcd->print(centreText("Present Card", 20));
     }
     else {
       lcd->clear();
       lcd->setCursor(0, 0);
-      lcd->print(centerText("CTF Mode", 20));
+      lcd->print(centreText("CTF Mode", 20));
       lcd->setCursor(0, 2);
-      lcd->print(centerText("Present Card", 20));
+      lcd->print(centreText("Present Card", 20));
     }
   } else {
     lcd->clear();
     lcd->setCursor(0, 0);
-    lcd->print(centerText("Door Sim - Ready", 20));
+    lcd->print(centreText("Door Sim - Ready", 20));
     lcd->setCursor(0, 2);
-    lcd->print(centerText("Present Card", 20));  
+    lcd->print(centreText("Present Card", 20));  
   }
 }
 
@@ -1118,7 +1182,7 @@ void ledOnValid() {
 // Handle invalid credentials
 void lcdInvalidCredentials() {
   if (!lcd) {
-    if (DEBUG_MODE) Serial.println("ERROR: Cannot display invalid credentials, LCD not initialised");
+    if (DEBUG_MODE) Serial.println("ERROR: Cannot display invalid credentials, LCD not initialized");
     return;
   }
   
@@ -1178,12 +1242,25 @@ void printCardData() {
       Serial.println("Valid credential found:");
       Serial.println("FC: " + String(result->facilityCode) + ", CN: " + String(result->cardNumber) + ", Name: " + result->name);
       
+      // Determine what message to show for valid card
+      String validMessage = "VALID";
+      if (flagMessageSelect == "custom" && customFlagMessage.length() > 0) {
+        validMessage = customFlagMessage;
+      }
+      
       if (lcd) {
         lcd->clear();
         lcd->setCursor(0, 0);
         lcd->print("Card Read: ");
+        
+        // Print the valid message, truncating if necessary to fit
+        String displayMessage = validMessage;
+        if (displayMessage.length() > 8) { // "Card Read: " takes 11 chars, leaving 9 for message
+          displayMessage = displayMessage.substring(0, 8);
+        }
         lcd->setCursor(11, 0);
-        lcd->print("VALID");
+        lcd->print(displayMessage);
+        
         lcd->setCursor(0, 1);
         lcd->print("FC: " + String(result->facilityCode));
         lcd->setCursor(9, 1);
@@ -1639,6 +1716,8 @@ void handleGetSettings() {
     doc["apChannel"] = ap_channel;
     doc["welcomeMessageSelect"] = welcomeMessageSelect;
     doc["customMessage"] = customWelcomeMessage;
+    doc["flagMessageSelect"] = flagMessageSelect;
+    doc["customFlag"] = customFlagMessage;
     doc["ledValid"] = ledValid;
     doc["spkOnValid"] = spkOnValid;
     doc["spkOnInvalid"] = spkOnInvalid;
@@ -1653,6 +1732,12 @@ void handleSaveSettings() {
         JsonDocument doc;
         DeserializationError error = deserializeJson(doc, json);
         if (!error) {
+            // Store old WiFi settings to see if they changed
+            String oldSSID = ap_ssid;
+            String oldPassphrase = ap_passphrase;
+            int oldChannel = ap_channel;
+            int oldHidden = ssid_hidden;
+            
             // Parse the JSON and update settings
             MODE = doc["mode"] | "CTF";
             displayTimeout = doc["displayTimeout"] | 30000;
@@ -1662,11 +1747,21 @@ void handleSaveSettings() {
             ssid_hidden = doc["ssidHidden"] | 0;
             welcomeMessageSelect = doc["welcomeMessageSelect"] | "default";
             customWelcomeMessage = doc["customMessage"] | "";
+            flagMessageSelect = doc["flagMessageSelect"] | "default";
+            customFlagMessage = doc["customFlag"] | "";
             spkOnInvalid = doc["spkOnInvalid"] | 1;
             spkOnValid = doc["spkOnValid"] | 1;
             ledValid = doc["ledValid"] | 1;
             
             saveSettingsToPreferences();
+            
+            // Check if WiFi settings changed
+            if (oldSSID != ap_ssid || oldPassphrase != ap_passphrase || 
+                oldChannel != ap_channel || oldHidden != ssid_hidden) {
+                Serial.println("WiFi settings changed, restarting WiFi...");
+                setupWifi(); // Restart WiFi with new settings
+            }
+            
             server.send(200, "application/json", "{\"status\":\"success\"}");
         } else {
             server.send(400, "application/json", "{\"status\":\"error\",\"message\":\"Invalid JSON\"}");
@@ -1784,7 +1879,7 @@ void setup() {
     // Record start time for timeout detection
     setupStartTime = millis();
     
-    // Initialise serial communication first for debugging
+    // Initialize serial communication first for debugging
     Serial.begin(115200);
     
     // Wait a moment for serial to connect
@@ -1814,13 +1909,13 @@ void setup() {
     digitalWrite(RELAY1, HIGH);
     Serial.println("I/O pins configured");
     
-    // initialise LCD
-    bool lcdinitialised = initLCD();
-    if (lcdinitialised && lcd) {
+    // Initialize LCD
+    bool lcdInitialised = initLCD();
+    if (lcdInitialised && lcd) {
         Serial.println("LCD initialised successfully");
         lcd->clear();
         lcd->setCursor(0, 0);
-        lcd->print("initialising...");
+        lcd->print("Initialising...");
     }
     else {
         Serial.println("WARNING: Failed to initialise LCD");
@@ -1843,7 +1938,7 @@ void setup() {
     setupWifi();
     
     // Weigand initialisation
-    Serial.println("initialising Wiegand reader...");
+    Serial.println("Initialising Wiegand reader...");
     weigandCounter = WEIGAND_WAIT_TIME;
     
     // Setup web server only after WiFi is up
